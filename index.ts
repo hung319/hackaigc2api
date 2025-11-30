@@ -1,10 +1,10 @@
 /**
  * =================================================================================
- * HackAIGC-2API (Bun Edition) - Fixed Chat Logic
+ * HackAIGC-2API (Bun Edition) - Fixed Non-Stream Support (n8n Compatible)
  * =================================================================================
  */
 
-// Xử lý URL config để tránh lỗi 2 dấu gạch chéo (//api/chat)
+// Xử lý URL config
 const RAW_UPSTREAM = Bun.env.UPSTREAM_URL || "https://chat.hackaigc.com";
 const UPSTREAM_URL = RAW_UPSTREAM.replace(/\/+$/, ""); 
 
@@ -27,20 +27,18 @@ Bun.serve({
   async fetch(request) {
     const url = new URL(request.url);
     
-    // 1. CORS Preflight
     if (request.method === 'OPTIONS') return handleCors();
 
-    // 2. Routing Normalization
     let pathname = url.pathname;
     if (pathname.startsWith('/v1/')) pathname = pathname.substring(3);
     if (pathname.length > 1 && pathname.endsWith('/')) pathname = pathname.slice(0, -1);
 
-    // 3. Health Check
+    console.log(`[${request.method}] ${pathname}`);
+
     if (pathname === '/' || pathname === '/health') {
         return new Response(JSON.stringify({ status: "ok", mode: "bun-adapter" }), { headers: corsHeaders() });
     }
 
-    // 4. Auth
     if (!verifyAuth(request) && pathname !== '/models') {
       return new Response(JSON.stringify({
         error: { message: "Invalid API Key", type: "auth_error", code: "401" }
@@ -61,23 +59,23 @@ Bun.serve({
 });
 
 console.log(`🚀 Server running on port ${CONFIG.PORT}`);
-console.log(`🔗 Upstream: ${UPSTREAM_URL}`);
 
-// --- [Logic: Chat Completion] ---
+// --- [Logic: Chat Completion (Dual Mode)] ---
 async function handleChat(request) {
   try {
     const body = await request.json();
-    let { messages, model, stream } = body;
+    // Default stream là false nếu client không gửi
+    let { messages, model, stream = false } = body;
 
     // 1. Midjourney Interceptor
     if (model && model.toLowerCase().includes('midjourney')) {
         return handleImageAsChat(messages, stream);
     }
 
-    // 2. Prepare Payload (Sao chép chính xác logic file gốc)
+    // 2. Prepare Payload
     const internalModel = CONFIG.MODEL_MAP[model] || "gpt-3.5-turbo";
     const filteredMessages = messages.map(m => ({ role: m.role, content: m.content }));
-    const guestId = generateGuestId(); // <--- Đã fix độ dài ID
+    const guestId = generateGuestId();
     const headers = getFakeHeaders(guestId);
 
     const upstreamPayload = {
@@ -88,89 +86,117 @@ async function handleChat(request) {
       prompt: "",
       temperature: body.temperature || 0.7,
       enableWebSearch: false,
-      usedVoiceInput: false,
       deviceId: guestId
     };
 
-    console.log(`Sending to Upstream [${internalModel}]...`);
+    console.log(`Requesting [${internalModel}] | Stream: ${stream}`);
 
     // 3. Fetch Upstream
     const response = await fetch(`${UPSTREAM_URL}/api/chat`, {
-      method: "POST",
-      headers: headers,
-      body: JSON.stringify(upstreamPayload)
+      method: "POST", headers: headers, body: JSON.stringify(upstreamPayload)
     });
 
     if (!response.ok) {
         const errText = await response.text();
-        console.error(`❌ Upstream Error ${response.status}:`, errText);
         return new Response(JSON.stringify({ error: `Upstream Error: ${response.status}`, details: errText }), { 
             status: response.status, headers: corsHeaders() 
         });
     }
 
-    // 4. Stream Handling
-    const { readable, writable } = new TransformStream();
-    const writer = writable.getWriter();
-    const encoder = new TextEncoder();
+    // 4. Xử lý phản hồi (Chia nhánh Stream vs Buffered)
     const decoder = new TextDecoder();
+    const reader = response.body.getReader();
 
-    // Chạy nền để không block request
-    (async () => {
-      const reader = response.body.getReader();
-      let hasReceivedData = false;
+    if (stream) {
+        // === MODE A: STREAMING (SSE) ===
+        // Trả về từng chunk ngay lập tức cho Client (Chat UI)
+        const { readable, writable } = new TransformStream();
+        const writer = writable.getWriter();
+        const encoder = new TextEncoder();
 
-      try {
+        (async () => {
+            try {
+                while (true) {
+                    const { done, value } = await reader.read();
+                    if (done) break;
+                    const chunkText = decoder.decode(value, { stream: true });
+                    
+                    if (chunkText.includes('"type":"citations"')) continue;
+
+                    if (chunkText) {
+                        const chunk = {
+                            id: `chatcmpl-${Date.now()}`,
+                            object: "chat.completion.chunk",
+                            created: Math.floor(Date.now() / 1000),
+                            model: model,
+                            choices: [{ index: 0, delta: { content: chunkText }, finish_reason: null }]
+                        };
+                        await writer.write(encoder.encode(`data: ${JSON.stringify(chunk)}\n\n`));
+                    }
+                }
+                await writer.write(encoder.encode("data: [DONE]\n\n"));
+            } catch (err) {
+                console.error("Stream Error:", err);
+            } finally {
+                await writer.close();
+            }
+        })();
+
+        return new Response(readable, {
+            headers: corsHeaders({
+                "Content-Type": "text/event-stream",
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive"
+            })
+        });
+
+    } else {
+        // === MODE B: BUFFERED (JSON) ===
+        // Gom toàn bộ text lại rồi trả về 1 cục JSON (dành cho n8n, Postman)
+        let fullContent = "";
+        
         while (true) {
-          const { done, value } = await reader.read();
-          if (done) break;
-
-          const chunkText = decoder.decode(value, { stream: true });
-          
-          // Debug dòng đầu tiên để xem nó trả về cái gì
-          if (!hasReceivedData) {
-            console.log(`✅ First chunk received (${chunkText.length} bytes):`, chunkText.substring(0, 50));
-            hasReceivedData = true;
-          }
-
-          // Filter rác (file gốc có đoạn này)
-          if (chunkText.includes('"type":"citations"')) continue;
-
-          if (chunkText) {
-            const chunk = {
-              id: `chatcmpl-${Date.now()}`,
-              object: "chat.completion.chunk",
-              created: Math.floor(Date.now() / 1000),
-              model: model,
-              choices: [{ index: 0, delta: { content: chunkText }, finish_reason: null }]
-            };
-            await writer.write(encoder.encode(`data: ${JSON.stringify(chunk)}\n\n`));
-          }
+            const { done, value } = await reader.read();
+            if (done) break;
+            const chunkText = decoder.decode(value, { stream: true });
+            
+            if (chunkText.includes('"type":"citations"')) continue;
+            fullContent += chunkText;
         }
-        await writer.write(encoder.encode("data: [DONE]\n\n"));
-      } catch (err) {
-        console.error("Stream Loop Error:", err);
-        await writer.write(encoder.encode(`data: {"error": "${err.message}"}\n\n`));
-      } finally {
-        await writer.close();
-      }
-    })();
 
-    return new Response(readable, {
-      headers: corsHeaders({
-        "Content-Type": "text/event-stream",
-        "Cache-Control": "no-cache",
-        "Connection": "keep-alive"
-      })
-    });
+        // Tạo JSON Response chuẩn OpenAI
+        const jsonResponse = {
+            id: `chatcmpl-${Date.now()}`,
+            object: "chat.completion",
+            created: Math.floor(Date.now() / 1000),
+            model: model,
+            choices: [{
+                index: 0,
+                message: {
+                    role: "assistant",
+                    content: fullContent
+                },
+                finish_reason: "stop"
+            }],
+            usage: {
+                prompt_tokens: 0,
+                completion_tokens: fullContent.length,
+                total_tokens: fullContent.length
+            }
+        };
+
+        return new Response(JSON.stringify(jsonResponse), {
+            headers: corsHeaders({ "Content-Type": "application/json" })
+        });
+    }
 
   } catch (e) {
-    console.error("HandleChat Exception:", e);
+    console.error("HandleChat Error:", e);
     return new Response(JSON.stringify({ error: e.message }), { status: 500, headers: corsHeaders() });
   }
 }
 
-// --- [Logic: Standard Models] ---
+// --- [Các phần còn lại giữ nguyên] ---
 function handleModels() {
   const modelsData = Object.keys(CONFIG.MODEL_MAP).map(id => ({
     id: id, object: "model", created: 1677610602, owned_by: "openai", permission: []
@@ -178,7 +204,6 @@ function handleModels() {
   return new Response(JSON.stringify({ object: "list", data: modelsData }), { headers: corsHeaders() });
 }
 
-// --- [Logic: Image Handlers] ---
 async function handleImageAsChat(messages, stream) {
     const lastMsg = messages.reverse().find(m => m.role === 'user');
     const prompt = lastMsg ? lastMsg.content : "A cute cat";
@@ -198,7 +223,11 @@ async function handleImageAsChat(messages, stream) {
             });
             return new Response(s, { headers: corsHeaders({ "Content-Type": "text/event-stream" }) });
         } else {
-            return new Response(JSON.stringify({ choices: [{ message: { content: md } }] }), { headers: corsHeaders() });
+            return new Response(JSON.stringify({
+                id: `chatcmpl-${Date.now()}`,
+                object: "chat.completion",
+                choices: [{ message: { role: "assistant", content: md }, finish_reason: "stop" }] 
+            }), { headers: corsHeaders() });
         }
     } catch (e) {
         return new Response(JSON.stringify({ error: e.message }), { status: 500, headers: corsHeaders() });
@@ -215,7 +244,6 @@ async function handleImage(request) {
     }
 }
 
-// --- [Helpers] ---
 async function fetchImageBase64(prompt) {
     const guestId = generateGuestId();
     const res = await fetch(`${UPSTREAM_URL}/api/image`, {
@@ -227,14 +255,12 @@ async function fetchImageBase64(prompt) {
     return Buffer.from(buf).toString('base64');
 }
 
-// ★★★ QUAN TRỌNG: Hàm tạo ID giống hệt bản gốc (32 ký tự hex) ★★★
 function generateGuestId() {
   const randomHex = Array.from({length: 32}, () => Math.floor(Math.random() * 16).toString(16)).join('');
   return `guest_${randomHex}`;
 }
 
 function getFakeHeaders(guestId) {
-  // Tạo IP ngẫu nhiên để tránh rate limit theo IP
   const ip = `${Math.floor(Math.random()*255)}.${Math.floor(Math.random()*255)}.${Math.floor(Math.random()*255)}.${Math.floor(Math.random()*255)}`;
   return {
     "Content-Type": "application/json",
