@@ -1,12 +1,6 @@
 /**
  * =================================================================================
- * Project: HackAIGC-2API (Bun Edition)
- * Role: API Gateway / Proxy
- * Runtime: Bun v1.x
- * * [Chức năng]
- * 1. API Only: Loại bỏ Web UI, chỉ phục vụ JSON/Stream.
- * 2. Middleware: Intercept Midjourney requests -> convert to Markdown images.
- * 3. Auth: Bearer Token verification.
+ * HackAIGC-2API (Bun Edition) - OpenAI Standard Compliant
  * =================================================================================
  */
 
@@ -16,11 +10,12 @@ const CONFIG = {
   UPSTREAM_URL: Bun.env.UPSTREAM_URL || "https://chat.hackaigc.com",
   USER_AGENT: Bun.env.USER_AGENT || "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
   
-  // Model Mapping
+  // Model Mapping: Key là tên model hiển thị cho Client, Value là model gửi đi upstream
   MODEL_MAP: {
     "gpt-4o": "gpt-4o",
-    "o1-mini": "o3-mini",
-    "claude-3-opus": "mistral",
+    "gpt-4o-mini": "gpt-4o-mini",
+    "gpt-4-turbo": "gpt-4-turbo",
+    "claude-3-5-sonnet": "claude-3-5-sonnet",
     "midjourney": "midjourney" 
   }
 };
@@ -29,102 +24,150 @@ Bun.serve({
   port: CONFIG.PORT,
   async fetch(request) {
     const url = new URL(request.url);
-
-    // 1. CORS Preflight
+    
+    // 1. CORS Preflight (Bắt buộc cho Web Apps)
     if (request.method === 'OPTIONS') return handleCors();
 
-    // 2. Health Check (Thay thế Web UI cũ)
-    if (url.pathname === '/' || url.pathname === '/health') {
-        return new Response(JSON.stringify({ status: "ok", service: "HackAIGC-2API Bun Adapter" }), {
+    // 2. Định tuyến (Routing)
+    // Hỗ trợ cả /v1/models và /models, có hoặc không có dấu / ở cuối
+    let pathname = url.pathname;
+    if (pathname.startsWith('/v1/')) {
+        pathname = pathname.substring(3); // Bỏ /v1
+    }
+    // Bỏ dấu / ở cuối nếu có (trừ root)
+    if (pathname.length > 1 && pathname.endsWith('/')) {
+        pathname = pathname.slice(0, -1);
+    }
+
+    console.log(`[${request.method}] Path: ${pathname}`); // Debug log
+
+    // 3. Health Check
+    if (pathname === '/' || pathname === '/health') {
+        return new Response(JSON.stringify({ status: "ok", system: "HackAIGC Gateway" }), {
             headers: corsHeaders({ "Content-Type": "application/json" })
         });
     }
 
-    // 3. Authentication
+    // 4. Authentication Check
+    // Lưu ý: OpenAI yêu cầu Auth cho endpoint Models.
     if (!verifyAuth(request)) {
-      return new Response(JSON.stringify({ error: { message: "Unauthorized", type: "auth_error" } }), { 
+      return new Response(JSON.stringify({
+        error: {
+          message: "Incorrect API key provided.",
+          type: "invalid_request_error",
+          param: null,
+          code: "invalid_api_key"
+        }
+      }), { 
         status: 401, 
         headers: corsHeaders({ "Content-Type": "application/json" }) 
       });
     }
 
-    // 4. Routing (Strip /v1 prefix if present)
-    const path = url.pathname.replace('/v1', '');
-
+    // 5. API Handlers
     try {
-        if (path.endsWith('/chat/completions')) return await handleChat(request);
-        if (path.endsWith('/images/generations')) return await handleImage(request);
-        if (path.endsWith('/models')) return handleModels();
+        if (pathname === '/chat/completions') return await handleChat(request);
+        if (pathname === '/images/generations') return await handleImage(request);
+        if (pathname === '/models') return handleModels(); // <--- Standard Models Handler
+        
+        return new Response(JSON.stringify({ error: { message: `Path '${pathname}' not found` } }), { status: 404, headers: corsHeaders() });
     } catch (e) {
-        console.error(`[Error] ${path}:`, e);
-        return new Response(JSON.stringify({ error: "Internal Server Error", details: e.message }), { status: 500, headers: corsHeaders() });
+        console.error(`Error processing ${pathname}:`, e);
+        return new Response(JSON.stringify({ error: { message: e.message } }), { status: 500, headers: corsHeaders() });
     }
-
-    return new Response(JSON.stringify({ error: "Not Found" }), { status: 404, headers: corsHeaders() });
   },
 });
 
-console.log(`🚀 Server running at http://localhost:${CONFIG.PORT}`);
+console.log(`🚀 Server listening on port ${CONFIG.PORT}`);
 
-// --- [Logic Chat & Interceptor] ---
+// --- [Logic: Standard OpenAI Models] ---
+// Trả về danh sách model đúng chuẩn OpenAI Spec
+function handleModels() {
+  const currentTimestamp = Math.floor(Date.now() / 1000);
+  
+  const modelsData = Object.keys(CONFIG.MODEL_MAP).map(modelId => ({
+    id: modelId,
+    object: "model",
+    created: 1677610602, // Mốc thời gian cố định hoặc currentTimestamp
+    owned_by: "openai",  // GIỮ NGUYÊN "openai" hoặc "system" để client nhận diện tốt nhất
+    permission: [        // Một số client cũ yêu cầu trường này
+        {
+            id: `modelperm-${modelId}`,
+            object: "model_permission",
+            created: currentTimestamp,
+            allow_create_engine: false,
+            allow_sampling: true,
+            allow_logprobs: true,
+            allow_search_indices: false,
+            allow_view: true,
+            allow_fine_tuning: false,
+            organization: "*",
+            group: null,
+            is_blocking: false
+        }
+    ],
+    root: modelId,
+    parent: null
+  }));
+
+  return new Response(JSON.stringify({
+    object: "list",
+    data: modelsData
+  }), {
+    headers: corsHeaders({ "Content-Type": "application/json" })
+  });
+}
+
+// --- [Logic: Chat Completion] ---
 async function handleChat(request) {
   try {
     const body = await request.json();
     let { messages, model, stream } = body;
-    
-    // Interceptor: Nếu model là midjourney, chuyển sang xử lý ảnh trả về markdown
-    if (model && model.includes('midjourney')) {
+
+    // Midjourney Interceptor
+    if (model && model.toLowerCase().includes('midjourney')) {
         return handleImageAsChat(messages, stream);
     }
 
     const internalModel = CONFIG.MODEL_MAP[model] || "gpt-3.5-turbo";
     const filteredMessages = messages.map(m => ({ role: m.role, content: m.content }));
     const guestId = generateGuestId();
-    const headers = getFakeHeaders(guestId);
-
-    const upstreamPayload = {
-      user_id: guestId,
-      user_level: "free",
-      model: internalModel,
-      messages: filteredMessages,
-      prompt: "",
-      temperature: body.temperature || 0.7,
-      enableWebSearch: false,
-      usedVoiceInput: false,
-      deviceId: guestId
-    };
-
+    
+    // Upstream Request
     const response = await fetch(`${CONFIG.UPSTREAM_URL}/api/chat`, {
       method: "POST",
-      headers: headers,
-      body: JSON.stringify(upstreamPayload)
+      headers: getFakeHeaders(guestId),
+      body: JSON.stringify({
+        user_id: guestId,
+        user_level: "free",
+        model: internalModel,
+        messages: filteredMessages,
+        temperature: body.temperature || 0.7,
+        enableWebSearch: false, // Tắt search để nhanh hơn
+        deviceId: guestId
+      })
     });
 
     if (!response.ok) {
-      const errText = await response.text();
-      return new Response(JSON.stringify({ error: `Upstream Error: ${response.status}`, details: errText }), { 
-          status: response.status, 
-          headers: corsHeaders({ "Content-Type": "application/json" }) 
-      });
+        const errText = await response.text();
+        throw new Error(`Upstream ${response.status}: ${errText}`);
     }
 
-    // Proxy Stream
+    // Stream Handling
     const { readable, writable } = new TransformStream();
     const writer = writable.getWriter();
     const encoder = new TextEncoder();
     const decoder = new TextDecoder();
 
-    // Background processing without blocking return
     (async () => {
       const reader = response.body.getReader();
       try {
         while (true) {
           const { done, value } = await reader.read();
           if (done) break;
-
           const chunkText = decoder.decode(value, { stream: true });
-          // Filter citation artifacts if necessary
-          if (chunkText.includes('"type":"citations"')) continue;
+          // Filter rác nếu cần
+          if (chunkText.includes('"type":"citations"')) continue; 
 
           if (chunkText) {
             const chunk = {
@@ -132,11 +175,7 @@ async function handleChat(request) {
               object: "chat.completion.chunk",
               created: Math.floor(Date.now() / 1000),
               model: model,
-              choices: [{
-                index: 0,
-                delta: { content: chunkText },
-                finish_reason: null
-              }]
+              choices: [{ index: 0, delta: { content: chunkText }, finish_reason: null }]
             };
             await writer.write(encoder.encode(`data: ${JSON.stringify(chunk)}\n\n`));
           }
@@ -144,7 +183,8 @@ async function handleChat(request) {
         await writer.write(encoder.encode("data: [DONE]\n\n"));
       } catch (err) {
         console.error("Stream Error:", err);
-        await writer.write(encoder.encode(`data: {"error": "${err.message}"}\n\n`));
+        const errChunk = { error: err.message };
+        await writer.write(encoder.encode(`data: ${JSON.stringify(errChunk)}\n\n`));
       } finally {
         await writer.close();
       }
@@ -159,145 +199,111 @@ async function handleChat(request) {
     });
 
   } catch (e) {
-    return new Response(JSON.stringify({ error: e.message }), { status: 500, headers: corsHeaders() });
+    return new Response(JSON.stringify({ error: { message: e.message, type: "server_error" } }), { status: 500, headers: corsHeaders() });
   }
 }
 
-// --- [Logic Image to Markdown (Chat Adapter)] ---
+// --- [Logic: Image Adapter] ---
 async function handleImageAsChat(messages, stream) {
-    const lastUserMsg = messages.reverse().find(m => m.role === 'user');
-    const prompt = lastUserMsg ? lastUserMsg.content : "A cute cat";
-
+    const lastMsg = messages.reverse().find(m => m.role === 'user');
+    const prompt = lastMsg ? lastMsg.content : "A cute cat";
+    
     try {
-        const base64Image = await fetchImageBase64(prompt);
-        const markdownContent = `🎨 **绘图完成**\n\n![Generated Image](data:image/png;base64,${base64Image})`;
-
+        const b64 = await fetchImageBase64(prompt);
+        const md = `🎨 **Generated Image**\n\n![Img](data:image/png;base64,${b64})`;
+        
+        // Trả về định dạng Stream giả lập để Client tưởng là Chat
         if (stream) {
             const encoder = new TextEncoder();
-            const { readable, writable } = new TransformStream();
-            const writer = writable.getWriter();
-
-            (async () => {
-                const chunk = {
-                    id: `chatcmpl-${Date.now()}`,
-                    object: "chat.completion.chunk",
-                    created: Math.floor(Date.now() / 1000),
-                    model: "midjourney",
-                    choices: [{ index: 0, delta: { content: markdownContent }, finish_reason: "stop" }]
-                };
-                await writer.write(encoder.encode(`data: ${JSON.stringify(chunk)}\n\n`));
-                await writer.write(encoder.encode("data: [DONE]\n\n"));
-                await writer.close();
-            })();
-
-            return new Response(readable, {
-                headers: corsHeaders({ "Content-Type": "text/event-stream", "Cache-Control": "no-cache" })
+            const s = new ReadableStream({
+                async start(controller) {
+                    const chunk = {
+                        id: `chatcmpl-${Date.now()}`,
+                        object: "chat.completion.chunk",
+                        created: Math.floor(Date.now() / 1000),
+                        model: "midjourney",
+                        choices: [{ index: 0, delta: { content: md }, finish_reason: "stop" }]
+                    };
+                    controller.enqueue(encoder.encode(`data: ${JSON.stringify(chunk)}\n\n`));
+                    controller.enqueue(encoder.encode("data: [DONE]\n\n"));
+                    controller.close();
+                }
             });
-        } else {
+            return new Response(s, { headers: corsHeaders({ "Content-Type": "text/event-stream" }) });
+        } 
+        // Trả về JSON thường
+        else {
             return new Response(JSON.stringify({
                 id: `chatcmpl-${Date.now()}`,
                 object: "chat.completion",
                 created: Math.floor(Date.now() / 1000),
                 model: "midjourney",
-                choices: [{ index: 0, message: { role: "assistant", content: markdownContent }, finish_reason: "stop" }]
+                choices: [{ index: 0, message: { role: "assistant", content: md }, finish_reason: "stop" }],
+                usage: { prompt_tokens: 10, completion_tokens: 20, total_tokens: 30 }
             }), { headers: corsHeaders({ "Content-Type": "application/json" }) });
         }
     } catch (e) {
-        return new Response(JSON.stringify({ error: e.message }), { status: 500, headers: corsHeaders() });
+        return new Response(JSON.stringify({ error: { message: e.message } }), { status: 500, headers: corsHeaders() });
     }
 }
 
-// --- [Logic Standard Image API] ---
+// --- [Logic: Standard Image Gen] ---
 async function handleImage(request) {
-  try {
-    const body = await request.json();
-    const prompt = body.prompt;
-    
-    const base64Image = await fetchImageBase64(prompt);
-
-    const openAIResponse = {
-      created: Math.floor(Date.now() / 1000),
-      data: [{ b64_json: base64Image, revised_prompt: prompt }]
-    };
-
-    return new Response(JSON.stringify(openAIResponse), {
-      headers: corsHeaders({ "Content-Type": "application/json" })
-    });
-
-  } catch (e) {
-    return new Response(JSON.stringify({ error: { message: e.message } }), { status: 500, headers: corsHeaders() });
-  }
+    try {
+        const body = await request.json();
+        const b64 = await fetchImageBase64(body.prompt);
+        return new Response(JSON.stringify({
+            created: Math.floor(Date.now() / 1000),
+            data: [{ b64_json: b64, revised_prompt: body.prompt }]
+        }), { headers: corsHeaders({ "Content-Type": "application/json" }) });
+    } catch (e) {
+        return new Response(JSON.stringify({ error: { message: e.message } }), { status: 500, headers: corsHeaders() });
+    }
 }
 
-// --- [Core Logic: Upstream Fetch] ---
+// --- [Helpers] ---
 async function fetchImageBase64(prompt) {
     const guestId = generateGuestId();
     const headers = getFakeHeaders(guestId);
-
-    const response = await fetch(`${CONFIG.UPSTREAM_URL}/api/image`, {
-      method: "POST",
-      headers: { ...headers, "Accept": "image/png,image/jpeg,*/*" },
-      body: JSON.stringify({
-        prompt: prompt,
-        user_id: guestId,
-        device_id: guestId,
-        user_level: "free"
-      })
+    // Giả lập gọi upstream
+    const res = await fetch(`${CONFIG.UPSTREAM_URL}/api/image`, {
+        method: "POST", headers: { ...headers, "Accept": "image/*" },
+        body: JSON.stringify({ prompt, user_id: guestId, device_id: guestId, user_level: "free" })
     });
-
-    if (!response.ok) {
-      const errText = await response.text();
-      throw new Error(`Upstream Error (${response.status}): ${errText.substring(0, 100)}`);
-    }
-
-    const imageBuffer = await response.arrayBuffer();
-    if (imageBuffer.byteLength === 0) throw new Error("Empty image received");
-    
-    return Buffer.from(imageBuffer).toString('base64');
-}
-
-// --- [Utilities] ---
-function handleModels() {
-  const models = Object.keys(CONFIG.MODEL_MAP).map(id => ({
-    id: id, object: "model", created: 1677610602, owned_by: "hackaigc"
-  }));
-  return new Response(JSON.stringify({ object: "list", data: models }), { headers: corsHeaders() });
-}
-
-function generateGuestId() {
-  const randomHex = Array.from({length: 32}, () => Math.floor(Math.random() * 16).toString(16)).join('');
-  return `guest_${randomHex}`;
-}
-
-function getFakeHeaders(guestId) {
-  const ip = `${Math.floor(Math.random()*255)}.${Math.floor(Math.random()*255)}.${Math.floor(Math.random()*255)}.${Math.floor(Math.random()*255)}`;
-  return {
-    "Content-Type": "application/json",
-    "Authorization": `Bearer anonymous_${guestId}`,
-    "User-Agent": CONFIG.USER_AGENT,
-    "Origin": CONFIG.UPSTREAM_URL,
-    "Referer": `${CONFIG.UPSTREAM_URL}/`,
-    "X-Forwarded-For": ip,
-    "X-Real-IP": ip
-  };
+    if (!res.ok) throw new Error(`Upstream Image Error: ${res.status}`);
+    const buf = await res.arrayBuffer();
+    if (buf.byteLength === 0) throw new Error("Empty image");
+    return Buffer.from(buf).toString('base64');
 }
 
 function verifyAuth(req) {
-  const authHeader = req.headers.get("Authorization");
-  if (!authHeader) return false;
-  const token = authHeader.replace('Bearer ', '').trim();
-  return token === CONFIG.API_MASTER_KEY;
+    const auth = req.headers.get("Authorization");
+    if (!auth) return false;
+    return auth.replace('Bearer ', '').trim() === CONFIG.API_MASTER_KEY;
 }
 
 function handleCors() {
-  return new Response(null, { status: 204, headers: corsHeaders() });
+    return new Response(null, { status: 204, headers: corsHeaders() });
 }
 
 function corsHeaders(headers = {}) {
-  return {
-    ...headers,
-    "Access-Control-Allow-Origin": "*",
-    "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-    "Access-Control-Allow-Headers": "*"
-  };
+    return {
+        ...headers,
+        "Access-Control-Allow-Origin": "*",
+        "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
+        "Access-Control-Allow-Headers": "Content-Type, Authorization, X-Requested-With",
+        "Access-Control-Allow-Credentials": "true"
+    };
+}
+
+function generateGuestId() { return `guest_${Math.random().toString(36).slice(2)}`; }
+
+function getFakeHeaders(guestId) {
+    return {
+        "Content-Type": "application/json",
+        "Authorization": `Bearer anonymous_${guestId}`,
+        "User-Agent": CONFIG.USER_AGENT,
+        "Origin": CONFIG.UPSTREAM_URL,
+        "Referer": `${CONFIG.UPSTREAM_URL}/`
+    };
 }
