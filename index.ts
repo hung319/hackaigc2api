@@ -1,32 +1,30 @@
 /**
  * =================================================================================
- * Project: HackAIGC-2API (Standard OpenAI Edition)
+ * Project: HackAIGC-2API (v2.1 Fix Models)
  * Refactored by: CezDev
  * Runtime: Bun v1.x
- * * [Change Log v2]
- * 1. Hỗ trợ đầy đủ Non-Stream (Request đợi generate xong mới trả JSON).
- * 2. Chuẩn hóa format response OpenAI (bao gồm field 'usage').
- * 3. Tự động gom stream từ upstream để trả về Non-stream nếu client yêu cầu.
  * =================================================================================
  */
 
-// 1. Config & Environment
+// 1. Config
 const CONFIG = {
   PORT: parseInt(Bun.env.PORT || "3000"),
   API_MASTER_KEY: Bun.env.API_MASTER_KEY || "sk-hackaigc-free",
   UPSTREAM_URL: Bun.env.UPSTREAM_URL || "https://chat.hackaigc.com",
   USER_AGENT: Bun.env.USER_AGENT || "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
   
+  // Mapping: Key (Tên hiển thị cho Client) -> Value (Tên model gửi lên Upstream)
   MODEL_MAP: {
     "gpt-4o": "gpt-4o",
     "gpt-4-turbo": "gpt-4o",
+    "gpt-3.5-turbo": "gpt-3.5-turbo",
     "o1-mini": "o3-mini",
     "claude-3-opus": "mistral",
     "midjourney": "midjourney" 
   }
 };
 
-console.log(`🚀 OpenAI Standard Proxy running on port ${CONFIG.PORT}`);
+console.log(`🚀 Service running on port ${CONFIG.PORT} (Models Fixed)`);
 
 // 2. Server Entry
 Bun.serve({
@@ -34,38 +32,76 @@ Bun.serve({
   async fetch(request) {
     const url = new URL(request.url);
 
-    // CORS & Health
+    // CORS Preflight
     if (request.method === 'OPTIONS') return handleCors();
+    
+    // Health Check
     if (url.pathname === '/health') return new Response("OK", { status: 200 });
 
-    // Auth
+    // Authentication
     if (!verifyAuth(request)) {
       return errorResponse("Unauthorized", "auth_error", 401);
     }
 
-    // Routing
-    const path = url.pathname.replace('/v1', '');
+    // Routing Logic (Xử lý đường dẫn chuẩn hơn)
+    // Loại bỏ /v1 ở đầu nếu có để dễ xử lý
+    let path = url.pathname;
+    if (path.startsWith('/v1')) {
+        path = path.slice(3); // Remove '/v1'
+    }
 
-    if (path.endsWith('/chat/completions') && request.method === 'POST') return handleChat(request);
-    if (path.endsWith('/images/generations') && request.method === 'POST') return handleImage(request);
-    if (path.endsWith('/models')) return handleModels();
+    // --- Routes ---
+    
+    // 1. GET /models
+    if (path === '/models' && request.method === 'GET') {
+        return handleModels();
+    }
+
+    // 2. POST /chat/completions
+    if (path === '/chat/completions' && request.method === 'POST') {
+        return handleChat(request);
+    }
+
+    // 3. POST /images/generations
+    if (path === '/images/generations' && request.method === 'POST') {
+        return handleImage(request);
+    }
 
     return errorResponse("Not Found", "invalid_request_error", 404);
   }
 });
 
-// --- [Logic Core: Chat Completion] ---
+// --- [Handler: Models List] (ĐÃ SỬA) ---
+function handleModels() {
+    // Tự động tạo list từ MODEL_MAP
+    const data = Object.keys(CONFIG.MODEL_MAP).map(id => ({
+        id: id,
+        object: "model",
+        created: 1715367049, // Timestamp tĩnh
+        owned_by: "system", // 'system' hoặc 'openai' đều được
+        permission: [],
+        root: id,
+        parent: null
+    }));
+
+    return new Response(JSON.stringify({ object: "list", data: data }), {
+        // ★ QUAN TRỌNG: Phải có Content-Type application/json
+        headers: corsHeaders({ "Content-Type": "application/json" }) 
+    });
+}
+
+// --- [Handler: Chat] ---
 async function handleChat(request) {
   try {
     const body = await request.json();
-    let { messages, model, stream = false, temperature = 0.7 } = body; // Default stream to false
+    let { messages, model, stream = false, temperature = 0.7 } = body;
 
-    // ★ Interceptor: Midjourney as Chat
+    // Interceptor: Midjourney as Chat
     if (model.includes('midjourney')) {
         return handleImageAsChat(messages, stream);
     }
 
-    // Prepare Upstream Request
+    // Normal Chat Proxy
     const internalModel = CONFIG.MODEL_MAP[model] || "gpt-3.5-turbo";
     const guestId = generateGuestId();
     const headers = getFakeHeaders(guestId);
@@ -88,15 +124,9 @@ async function handleChat(request) {
     });
 
     if (!response.ok) {
-        const text = await response.text();
-        return errorResponse(`Upstream Error: ${response.status} - ${text}`, "upstream_error", response.status);
+        return errorResponse(`Upstream Error: ${response.status}`, "upstream_error", response.status);
     }
 
-    // ★ Fork: Stream vs Non-Stream handling
-    // Upstream luôn trả về Stream, nên ta cần xử lý 2 case:
-    // 1. Client cần Stream -> Pipe thẳng (Transform).
-    // 2. Client cần Non-Stream -> Đọc hết Stream, gom text, trả JSON.
-    
     if (stream) {
         return handleStreamProxy(response, model);
     } else {
@@ -104,17 +134,16 @@ async function handleChat(request) {
     }
 
   } catch (e) {
-    console.error(e);
     return errorResponse(e.message, "server_error", 500);
   }
 }
 
-// --- [Handler A: Streaming Response (SSE)] ---
+// --- [Handler: Stream Proxy] ---
 async function handleStreamProxy(upstreamResponse, model) {
     const { readable, writable } = new TransformStream();
     const writer = writable.getWriter();
-    const encoder = new TextEncoder();
     const decoder = new TextDecoder();
+    const encoder = new TextEncoder();
 
     (async () => {
         const reader = upstreamResponse.body.getReader();
@@ -122,74 +151,63 @@ async function handleStreamProxy(upstreamResponse, model) {
             while (true) {
                 const { done, value } = await reader.read();
                 if (done) break;
-
                 const chunkText = decoder.decode(value, { stream: true });
-                // Filter out upstream noise if needed
-                if (chunkText.includes('"type":"citations"')) continue; 
+                if (chunkText.includes('"type":"citations"')) continue;
 
                 if (chunkText) {
-                    const chunk = createOpenAIChunk(chunkText, model);
+                    const chunk = {
+                        id: `chatcmpl-${Date.now()}`,
+                        object: "chat.completion.chunk",
+                        created: Math.floor(Date.now() / 1000),
+                        model: model,
+                        choices: [{ index: 0, delta: { content: chunkText }, finish_reason: null }]
+                    };
                     await writer.write(encoder.encode(`data: ${JSON.stringify(chunk)}\n\n`));
                 }
             }
             await writer.write(encoder.encode("data: [DONE]\n\n"));
-        } catch (err) {
-            await writer.write(encoder.encode(`data: {"error": "${err.message}"}\n\n`));
+        } catch (e) {
+            await writer.write(encoder.encode(`data: {"error": "${e.message}"}\n\n`));
         } finally {
             await writer.close();
         }
     })();
 
     return new Response(readable, {
-        headers: corsHeaders({
-            "Content-Type": "text/event-stream",
+        headers: corsHeaders({ 
+            "Content-Type": "text/event-stream", 
             "Cache-Control": "no-cache",
             "Connection": "keep-alive"
         })
     });
 }
 
-// --- [Handler B: Non-Streaming Response (Standard JSON)] ---
+// --- [Handler: Non-Stream Proxy] ---
 async function handleNonStreamProxy(upstreamResponse, model) {
     const reader = upstreamResponse.body.getReader();
     const decoder = new TextDecoder();
     let fullContent = "";
 
-    // 1. Consume the entire stream
     while (true) {
         const { done, value } = await reader.read();
         if (done) break;
-        
         const chunkText = decoder.decode(value, { stream: true });
-        if (chunkText.includes('"type":"citations"')) continue;
-        
-        if (chunkText) {
+        if (!chunkText.includes('"type":"citations"')) {
             fullContent += chunkText;
         }
     }
 
-    // 2. Construct Standard OpenAI JSON
-    const responseId = `chatcmpl-${Date.now()}`;
     const jsonResponse = {
-        id: responseId,
+        id: `chatcmpl-${Date.now()}`,
         object: "chat.completion",
         created: Math.floor(Date.now() / 1000),
         model: model,
-        choices: [
-            {
-                index: 0,
-                message: {
-                    role: "assistant",
-                    content: fullContent
-                },
-                finish_reason: "stop"
-            }
-        ],
-        usage: {
-            prompt_tokens: 0, // Mock value
-            completion_tokens: estimateTokenCount(fullContent),
-            total_tokens: estimateTokenCount(fullContent)
-        }
+        choices: [{
+            index: 0,
+            message: { role: "assistant", content: fullContent },
+            finish_reason: "stop"
+        }],
+        usage: { prompt_tokens: 0, completion_tokens: fullContent.length, total_tokens: fullContent.length }
     };
 
     return new Response(JSON.stringify(jsonResponse), {
@@ -197,7 +215,7 @@ async function handleNonStreamProxy(upstreamResponse, model) {
     });
 }
 
-// --- [Logic: Midjourney Adapter] ---
+// --- [Handler: Image as Chat (Midjourney)] ---
 async function handleImageAsChat(messages, stream) {
     const lastUserMsg = messages.reverse().find(m => m.role === 'user');
     const prompt = lastUserMsg ? lastUserMsg.content : "Abstract art";
@@ -205,89 +223,66 @@ async function handleImageAsChat(messages, stream) {
     try {
         const base64Image = await fetchImageBase64(prompt);
         const markdownContent = `🎨 **绘图完成**\n\n![Generated Image](data:image/png;base64,${base64Image})`;
-        const model = "midjourney";
-
+        
         if (stream) {
-            // Simulate Streaming
             const encoder = new TextEncoder();
             const { readable, writable } = new TransformStream();
             const writer = writable.getWriter();
             (async () => {
-                const chunk = createOpenAIChunk(markdownContent, model);
+                const chunk = {
+                    id: `chatcmpl-${Date.now()}`,
+                    object: "chat.completion.chunk",
+                    created: Math.floor(Date.now() / 1000),
+                    model: "midjourney",
+                    choices: [{ index: 0, delta: { content: markdownContent }, finish_reason: null }]
+                };
                 await writer.write(encoder.encode(`data: ${JSON.stringify(chunk)}\n\n`));
                 await writer.write(encoder.encode("data: [DONE]\n\n"));
                 await writer.close();
             })();
-            return new Response(readable, {
-                headers: corsHeaders({ "Content-Type": "text/event-stream" })
-            });
+            return new Response(readable, { headers: corsHeaders({ "Content-Type": "text/event-stream" }) });
         } else {
-            // Standard JSON
             return new Response(JSON.stringify({
                 id: `chatcmpl-${Date.now()}`,
                 object: "chat.completion",
                 created: Math.floor(Date.now() / 1000),
-                model: model,
-                choices: [{ 
-                    index: 0, 
-                    message: { role: "assistant", content: markdownContent }, 
-                    finish_reason: "stop" 
-                }],
+                model: "midjourney",
+                choices: [{ index: 0, message: { role: "assistant", content: markdownContent }, finish_reason: "stop" }],
                 usage: { prompt_tokens: 10, completion_tokens: 50, total_tokens: 60 }
             }), { headers: corsHeaders({ "Content-Type": "application/json" }) });
         }
     } catch (e) {
-        return errorResponse(e.message, "image_generation_error", 500);
+        return errorResponse(e.message, "image_error", 500);
     }
 }
 
-// --- [Logic: Standard Image Endpoint] ---
+// --- [Handler: Standard Image] ---
 async function handleImage(request) {
     try {
         const body = await request.json();
-        const prompt = body.prompt;
-        const base64Image = await fetchImageBase64(prompt);
-
+        const base64Image = await fetchImageBase64(body.prompt);
         return new Response(JSON.stringify({
             created: Math.floor(Date.now() / 1000),
-            data: [{ b64_json: base64Image, revised_prompt: prompt }]
+            data: [{ b64_json: base64Image, revised_prompt: body.prompt }]
         }), { headers: corsHeaders({ "Content-Type": "application/json" }) });
     } catch (e) {
         return errorResponse(e.message, "image_error", 500);
     }
 }
 
-// --- [Helpers: Network & Utilities] ---
-
+// --- [Helpers] ---
 async function fetchImageBase64(prompt) {
     const guestId = generateGuestId();
     const headers = getFakeHeaders(guestId);
-    
-    // Upstream image API call
     const response = await fetch(`${CONFIG.UPSTREAM_URL}/api/image`, {
         method: "POST",
         headers: { ...headers, "Accept": "image/png,image/jpeg,*/*" },
         body: JSON.stringify({ prompt, user_id: guestId, device_id: guestId, user_level: "free" })
     });
-
-    if (!response.ok) throw new Error(`Upstream Image Error: ${response.status}`);
+    if (!response.ok) throw new Error("Upstream Image Failed");
     const buffer = await response.arrayBuffer();
-    if (buffer.byteLength === 0) throw new Error("Empty image received");
+    if (!buffer.byteLength) throw new Error("Empty Image");
     return Buffer.from(buffer).toString('base64');
-}
-
-function createOpenAIChunk(content, model) {
-    return {
-        id: `chatcmpl-${Date.now()}`,
-        object: "chat.completion.chunk",
-        created: Math.floor(Date.now() / 1000),
-        model: model,
-        choices: [{
-            index: 0,
-            delta: { content: content },
-            finish_reason: null
-        }]
-    };
 }
 
 function generateGuestId() {
@@ -329,16 +324,4 @@ function corsHeaders(extra = {}) {
 
 function handleCors() {
     return new Response(null, { status: 204, headers: corsHeaders() });
-}
-
-function estimateTokenCount(text) {
-    return Math.ceil(text.length / 4); // Rough estimation
-}
-
-// --- [API Models Endpoint] ---
-function handleModels() {
-    const data = Object.keys(CONFIG.MODEL_MAP).map(id => ({
-        id: id, object: "model", created: 1677610602, owned_by: "openai"
-    }));
-    return new Response(JSON.stringify({ object: "list", data }), { headers: corsHeaders() });
 }
